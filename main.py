@@ -1,14 +1,15 @@
 import os
 
 from fastapi import FastAPI, Query, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
+from typing import List
 from neo4j import GraphDatabase
 
 
 app = FastAPI(
     title="Chenjiaci Neo4j API",
-    description="陈家祠知识图谱查询与馆内导航服务",
-    version="1.1.0"
+    description="陈家祠知识图谱查询、图片识别与馆内导航服务",
+    version="1.2.0"
 )
 
 
@@ -31,8 +32,16 @@ driver = GraphDatabase.driver(
 # Model
 # ============================================================
 
+# 原来的文字实体查询
 class EntityQuery(BaseModel):
     name: str
+
+
+# 新增：图片识别匹配
+class ImageMatchRequest(BaseModel):
+    candidate_names: List[str] = Field(default_factory=list)
+    visual_keywords: List[str] = Field(default_factory=list)
+    craft: str = ""
 
 
 # ============================================================
@@ -45,9 +54,11 @@ def root():
     return {
         "status": "ok",
         "service": "Chenjiaci Neo4j API",
+        "version": "1.2.0",
         "available_tools": [
             "/health",
             "/entity",
+            "/image-match",
             "/indoor-route"
         ]
     }
@@ -79,7 +90,8 @@ def health():
 
 
 # ============================================================
-# 实体关系
+# 实体关系查询
+# 原功能：文字问题使用
 # ============================================================
 
 @app.post("/entity")
@@ -140,6 +152,244 @@ def search_entity(data: EntityQuery):
         "success": True,
         "query": name,
         "count": len(results),
+        "results": results
+    }
+
+
+# ============================================================
+# 图片识别实体匹配
+# 新功能：Dify Vision 使用
+# ============================================================
+
+@app.post("/image-match")
+def image_match(data: ImageMatchRequest):
+
+    # --------------------------------------------------------
+    # 1. 清洗 Vision LLM 传过来的数据
+    # --------------------------------------------------------
+
+    candidate_names = [
+        x.strip()
+        for x in data.candidate_names
+        if x and x.strip()
+    ]
+
+    visual_keywords = [
+        x.strip()
+        for x in data.visual_keywords
+        if x and x.strip()
+    ]
+
+    craft = data.craft.strip() if data.craft else ""
+
+    # 如果 Vision 什么都没有识别出来
+    if not candidate_names and not visual_keywords and not craft:
+
+        raise HTTPException(
+            status_code=400,
+            detail="candidate_names、visual_keywords 和 craft 不能同时为空"
+        )
+
+
+    # --------------------------------------------------------
+    # 2. Neo4j 图片实体匹配
+    #
+    # 评分：
+    # name 精确命中          +100
+    # alias 每命中一个        +40
+    # craft 匹配             +30
+    # visual keyword 每个     +10
+    # --------------------------------------------------------
+
+    query = """
+    WITH
+        $candidate_names AS candidate_names,
+        $visual_keywords AS visual_keywords,
+        trim(coalesce($craft, '')) AS craft
+
+    MATCH (n:ImageRecognizable)
+
+    WITH
+        n,
+        candidate_names,
+        visual_keywords,
+        craft,
+
+        CASE
+            WHEN n.name IN candidate_names
+            THEN 100
+            ELSE 0
+        END AS name_score,
+
+        [
+            x IN candidate_names
+            WHERE x IN coalesce(n.aliases, [])
+        ] AS matched_aliases,
+
+        [
+            x IN visual_keywords
+            WHERE x IN coalesce(n.visual_keywords, [])
+        ] AS matched_keywords,
+
+        CASE
+            WHEN craft <> ''
+                 AND (
+                     craft = coalesce(n.craft, '')
+                     OR craft IN coalesce(n.visual_keywords, [])
+                 )
+            THEN 30
+            ELSE 0
+        END AS craft_score
+
+
+    WITH
+        n,
+        matched_aliases,
+        matched_keywords,
+
+        name_score,
+
+        size(matched_aliases) * 40
+            AS alias_score,
+
+        size(matched_keywords) * 10
+            AS visual_score,
+
+        craft_score
+
+
+    WITH
+        n,
+        matched_aliases,
+        matched_keywords,
+
+        name_score,
+        alias_score,
+        visual_score,
+        craft_score,
+
+        name_score
+        + alias_score
+        + visual_score
+        + craft_score
+        AS score
+
+
+    WHERE score >= 40
+
+
+    # --------------------------------------------------------
+    # 3. 找到实体后，继续利用原图谱查询位置
+    # --------------------------------------------------------
+
+    OPTIONAL MATCH
+        (n)-[:LOCATED_IN|DISPLAYED_IN|EXHIBIT_DISPLAYED_IN_SPACE]->(loc)
+
+
+    RETURN
+        n.id AS id,
+        n.name AS name,
+
+        labels(n) AS labels,
+
+        n.craft AS craft,
+
+        n.location AS location,
+
+        collect(DISTINCT loc.name) AS related_locations,
+
+        n.visual_keywords AS visual_keywords,
+
+        n.visual_description AS visual_description,
+
+        n.recognition_hint AS recognition_hint,
+
+        matched_aliases,
+
+        matched_keywords,
+
+        name_score,
+        alias_score,
+        visual_score,
+        craft_score,
+
+        score
+
+    ORDER BY score DESC
+
+    LIMIT 5
+    """
+
+
+    # --------------------------------------------------------
+    # 4. 执行 Neo4j 查询
+    # --------------------------------------------------------
+
+    try:
+
+        records, summary, keys = driver.execute_query(
+            query,
+            candidate_names=candidate_names,
+            visual_keywords=visual_keywords,
+            craft=craft
+        )
+
+    except Exception as e:
+
+        raise HTTPException(
+            status_code=500,
+            detail=f"图片实体匹配失败：{str(e)}"
+        )
+
+
+    results = [
+        record.data()
+        for record in records
+    ]
+
+
+    # --------------------------------------------------------
+    # 5. 没找到
+    # --------------------------------------------------------
+
+    if not results:
+
+        return {
+            "success": True,
+            "matched": False,
+
+            "input": {
+                "candidate_names": candidate_names,
+                "visual_keywords": visual_keywords,
+                "craft": craft
+            },
+
+            "message": "当前知识图谱中没有找到置信度足够高的图片匹配实体。",
+
+            "results": []
+        }
+
+
+    # --------------------------------------------------------
+    # 6. 找到了
+    # --------------------------------------------------------
+
+    best_match = results[0]
+
+    return {
+        "success": True,
+        "matched": True,
+
+        "input": {
+            "candidate_names": candidate_names,
+            "visual_keywords": visual_keywords,
+            "craft": craft
+        },
+
+        "best_match": best_match,
+
+        "count": len(results),
+
         "results": results
     }
 
@@ -217,6 +467,7 @@ def get_indoor_route(
         END AS steps
     """
 
+
     try:
 
         records, summary, keys = driver.execute_query(
@@ -248,6 +499,7 @@ def get_indoor_route(
     record = records[0]
 
     route = record["route"]
+
 
     if not route:
 
