@@ -13,9 +13,6 @@ app = FastAPI(
 )
 
 
-# ============================================================
-# Aura
-# ============================================================
 
 NEO4J_URI = os.getenv("NEO4J_URI")
 NEO4J_USER = os.getenv("NEO4J_USERNAME")
@@ -28,25 +25,18 @@ driver = GraphDatabase.driver(
 )
 
 
-# ============================================================
-# Model
-# ============================================================
 
-# 原来的文字实体查询
 class EntityQuery(BaseModel):
     name: str
 
 
-# 新增：图片识别匹配
 class ImageMatchRequest(BaseModel):
     candidate_names: List[str] = Field(default_factory=list)
     visual_keywords: List[str] = Field(default_factory=list)
     craft: str = ""
 
 
-# ============================================================
-# 首页
-# ============================================================
+
 
 @app.get("/")
 def root():
@@ -64,9 +54,7 @@ def root():
     }
 
 
-# ============================================================
-# Aura 健康检查
-# ============================================================
+
 
 @app.get("/health")
 def health():
@@ -89,10 +77,7 @@ def health():
         }
 
 
-# ============================================================
-# 实体关系查询
-# 原功能：文字问题使用
-# ============================================================
+
 
 @app.post("/entity")
 def search_entity(data: EntityQuery):
@@ -156,17 +141,11 @@ def search_entity(data: EntityQuery):
     }
 
 
-# ============================================================
-# 图片识别实体匹配
-# 新功能：Dify Vision 使用
-# ============================================================
 
 @app.post("/image-match")
 def image_match(data: ImageMatchRequest):
 
-    # --------------------------------------------------------
-    # 1. 清洗 Vision LLM 传过来的数据
-    # --------------------------------------------------------
+
 
     candidate_names = [
         x.strip()
@@ -182,7 +161,6 @@ def image_match(data: ImageMatchRequest):
 
     craft = data.craft.strip() if data.craft else ""
 
-    # 如果 Vision 什么都没有识别出来
     if not candidate_names and not visual_keywords and not craft:
 
         raise HTTPException(
@@ -191,15 +169,7 @@ def image_match(data: ImageMatchRequest):
         )
 
 
-    # --------------------------------------------------------
-    # 2. Neo4j 图片实体匹配
-    #
-    # 评分：
-    # name 精确命中          +100
-    # alias 每命中一个        +40
-    # craft 匹配             +30
-    # visual keyword 每个     +10
-    # --------------------------------------------------------
+
 
     query = """
     WITH
@@ -278,9 +248,7 @@ def image_match(data: ImageMatchRequest):
     WHERE score >= 40
 
 
-    # --------------------------------------------------------
-    # 3. 找到实体后，继续利用原图谱查询位置
-    # --------------------------------------------------------
+    
 
     OPTIONAL MATCH
         (n)-[:LOCATED_IN|DISPLAYED_IN|EXHIBIT_DISPLAYED_IN_SPACE]->(loc)
@@ -321,9 +289,7 @@ def image_match(data: ImageMatchRequest):
     """
 
 
-    # --------------------------------------------------------
-    # 4. 执行 Neo4j 查询
-    # --------------------------------------------------------
+
 
     try:
 
@@ -348,9 +314,7 @@ def image_match(data: ImageMatchRequest):
     ]
 
 
-    # --------------------------------------------------------
-    # 5. 没找到
-    # --------------------------------------------------------
+
 
     if not results:
 
@@ -370,9 +334,7 @@ def image_match(data: ImageMatchRequest):
         }
 
 
-    # --------------------------------------------------------
-    # 6. 找到了
-    # --------------------------------------------------------
+
 
     best_match = results[0]
 
@@ -394,9 +356,7 @@ def image_match(data: ImageMatchRequest):
     }
 
 
-# ============================================================
-# 馆内导航
-# ============================================================
+
 
 @app.get("/indoor-route")
 def get_indoor_route(
