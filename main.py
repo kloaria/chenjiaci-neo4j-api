@@ -5,19 +5,15 @@ from pydantic import BaseModel, Field
 from typing import List
 from neo4j import GraphDatabase
 
-
 app = FastAPI(
     title="Chenjiaci Neo4j API",
     description="陈家祠知识图谱查询、图片识别与馆内导航服务",
     version="1.2.0"
 )
 
-
-
 NEO4J_URI = os.getenv("NEO4J_URI")
 NEO4J_USER = os.getenv("NEO4J_USERNAME")
 NEO4J_PASSWORD = os.getenv("NEO4J_PASSWORD")
-
 
 driver = GraphDatabase.driver(
     NEO4J_URI,
@@ -25,12 +21,13 @@ driver = GraphDatabase.driver(
 )
 
 
-
 class EntityQuery(BaseModel):
     name: str
-class VisionQuery(BaseModel):
 
+
+class VisionQuery(BaseModel):
     candidate_names: List[str]
+
 
 class ImageMatchRequest(BaseModel):
     candidate_names: List[str] = Field(default_factory=list)
@@ -38,15 +35,11 @@ class ImageMatchRequest(BaseModel):
     craft: str = ""
 
 
-
 @app.post("/vision-entity")
 def vision_entity(data: VisionQuery):
+    names = data.candidate_names
 
-
-    names=data.candidate_names
-
-
-    query="""
+    query = """
 
     MATCH(n)
 
@@ -78,9 +71,7 @@ def vision_entity(data: VisionQuery):
 
     """
 
-
-
-    records,summary,keys = driver.execute_query(
+    records, summary, keys = driver.execute_query(
 
         query,
 
@@ -88,21 +79,20 @@ def vision_entity(data: VisionQuery):
 
     )
 
-
-
     return {
 
-        "success":True,
+        "success": True,
 
-        "results":[
+        "results": [
             r.data()
             for r in records
         ]
 
     }
+
+
 @app.get("/")
 def root():
-
     return {
         "status": "ok",
         "service": "Chenjiaci Neo4j API",
@@ -116,11 +106,8 @@ def root():
     }
 
 
-
-
 @app.get("/health")
 def health():
-
     try:
 
         driver.verify_connectivity()
@@ -139,15 +126,11 @@ def health():
         }
 
 
-
-
 @app.post("/entity")
 def search_entity(data: EntityQuery):
-
     name = data.name.strip()
 
     if not name:
-
         raise HTTPException(
             status_code=400,
             detail="实体名称不能为空"
@@ -203,12 +186,8 @@ def search_entity(data: EntityQuery):
     }
 
 
-
 @app.post("/image-match")
 def image_match(data: ImageMatchRequest):
-
-
-
     candidate_names = [
         x.strip()
         for x in data.candidate_names
@@ -224,22 +203,22 @@ def image_match(data: ImageMatchRequest):
     craft = data.craft.strip() if data.craft else ""
 
     if not candidate_names and not visual_keywords and not craft:
-
         raise HTTPException(
             status_code=400,
             detail="candidate_names、visual_keywords 和 craft 不能同时为空"
         )
 
-
-
-
     query = """
+
     WITH
         $candidate_names AS candidate_names,
         $visual_keywords AS visual_keywords,
-        trim(coalesce($craft, '')) AS craft
+        trim(coalesce($craft,'')) AS craft
 
-    MATCH (n:ImageRecognizable)
+
+    MATCH(n:ImageRecognizable)
+
+
 
     WITH
         n,
@@ -247,111 +226,171 @@ def image_match(data: ImageMatchRequest):
         visual_keywords,
         craft,
 
-        CASE
-            WHEN n.name IN candidate_names
-            THEN 100
-            ELSE 0
-        END AS name_score,
 
         [
             x IN candidate_names
-            WHERE x IN coalesce(n.aliases, [])
-        ] AS matched_aliases,
+            WHERE
+                toLower(n.name) CONTAINS toLower(x)
+                OR
+                toLower(x) CONTAINS toLower(n.name)
+                OR
+                ANY(
+                    a IN coalesce(n.aliases,[])
+                    WHERE
+                    toLower(a) CONTAINS toLower(x)
+                )
+        ]
+        AS matched_names,
+
+
 
         [
-            x IN visual_keywords
-            WHERE x IN coalesce(n.visual_keywords, [])
-        ] AS matched_keywords,
+            k IN visual_keywords
+            WHERE
+            ANY(
+                vk IN coalesce(n.visual_keywords,[])
+                WHERE
+                    toLower(vk) CONTAINS toLower(k)
+                    OR
+                    toLower(k) CONTAINS toLower(vk)
+            )
+        ]
+        AS matched_keywords
+
+
+
+
+    WITH
+        n,
+        matched_names,
+        matched_keywords,
+        craft,
+
+
+        size(matched_names)*50
+        AS name_score,
+
+
+        size(matched_keywords)*10
+        AS visual_score
+
+
+
+
+    WITH
+        n,
+        matched_names,
+        matched_keywords,
+        name_score,
+        visual_score,
+
 
         CASE
+
             WHEN craft <> ''
-                 AND (
-                     craft = coalesce(n.craft, '')
-                     OR craft IN coalesce(n.visual_keywords, [])
-                 )
-            THEN 30
+            AND
+            (
+                toLower(coalesce(n.craft,'')) 
+                CONTAINS 
+                toLower(craft)
+
+                OR
+
+                toLower(craft)
+                CONTAINS
+                toLower(coalesce(n.craft,''))
+            )
+
+            THEN 20
+
             ELSE 0
+
         END AS craft_score
 
 
-    WITH
-        n,
-        matched_aliases,
-        matched_keywords,
-
-        name_score,
-
-        size(matched_aliases) * 40
-            AS alias_score,
-
-        size(matched_keywords) * 10
-            AS visual_score,
-
-        craft_score
 
 
     WITH
         n,
-        matched_aliases,
+        matched_names,
         matched_keywords,
-
         name_score,
-        alias_score,
         visual_score,
         craft_score,
 
+
         name_score
-        + alias_score
-        + visual_score
-        + craft_score
+        +
+        visual_score
+        +
+        craft_score
+
         AS score
 
 
-    WHERE score >= 40
+
+    WHERE score >= 20
 
 
-    
 
     OPTIONAL MATCH
         (n)-[:LOCATED_IN|DISPLAYED_IN|EXHIBIT_DISPLAYED_IN_SPACE]->(loc)
 
 
+
     RETURN
+
+
         n.id AS id,
+
+
         n.name AS name,
+
 
         labels(n) AS labels,
 
+
         n.craft AS craft,
 
-        n.location AS location,
 
-        collect(DISTINCT loc.name) AS related_locations,
+        collect(DISTINCT loc.name)
+        AS related_locations,
+
 
         n.visual_keywords AS visual_keywords,
 
+
         n.visual_description AS visual_description,
+
 
         n.recognition_hint AS recognition_hint,
 
-        matched_aliases,
+
+        matched_names,
+
 
         matched_keywords,
 
+
         name_score,
-        alias_score,
+
+
         visual_score,
+
+
         craft_score,
+
 
         score
 
+
+
     ORDER BY score DESC
 
+
     LIMIT 5
+
     """
-
-
-
 
     try:
 
@@ -369,17 +408,12 @@ def image_match(data: ImageMatchRequest):
             detail=f"图片实体匹配失败：{str(e)}"
         )
 
-
     results = [
         record.data()
         for record in records
     ]
 
-
-
-
     if not results:
-
         return {
             "success": True,
             "matched": False,
@@ -394,9 +428,6 @@ def image_match(data: ImageMatchRequest):
 
             "results": []
         }
-
-
-
 
     best_match = results[0]
 
@@ -418,34 +449,29 @@ def image_match(data: ImageMatchRequest):
     }
 
 
-
-
 @app.get("/indoor-route")
 def get_indoor_route(
 
-    start: str = Query(
-        ...,
-        description="起点，例如：前院、聚贤堂、祖堂"
-    ),
+        start: str = Query(
+            ...,
+            description="起点，例如：前院、聚贤堂、祖堂"
+        ),
 
-    end: str = Query(
-        ...,
-        description="终点，例如：聚贤堂、祖堂"
-    )
+        end: str = Query(
+            ...,
+            description="终点，例如：聚贤堂、祖堂"
+        )
 ):
-
     start = start.strip()
     end = end.strip()
 
     if not start or not end:
-
         raise HTTPException(
             status_code=400,
             detail="起点和终点不能为空"
         )
 
     if start == end:
-
         return {
             "success": True,
             "found": True,
@@ -459,7 +485,6 @@ def get_indoor_route(
             "message": "您已经在目标地点。",
             "source": "陈家祠馆内导航知识图谱"
         }
-
 
     query = """
     MATCH (start:Space {name: $start})
@@ -489,7 +514,6 @@ def get_indoor_route(
         END AS steps
     """
 
-
     try:
 
         records, summary, keys = driver.execute_query(
@@ -505,9 +529,7 @@ def get_indoor_route(
             detail=f"馆内路线查询失败：{str(e)}"
         )
 
-
     if not records:
-
         return {
             "success": True,
             "found": False,
@@ -517,14 +539,11 @@ def get_indoor_route(
             "message": "当前数据库中未找到起点或终点。"
         }
 
-
     record = records[0]
 
     route = record["route"]
 
-
     if not route:
-
         return {
             "success": True,
             "found": False,
@@ -533,7 +552,6 @@ def get_indoor_route(
             "route": [],
             "message": "当前导航数据中暂未找到两个地点之间的路径。"
         }
-
 
     return {
         "success": True,
