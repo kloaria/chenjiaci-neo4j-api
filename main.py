@@ -28,7 +28,9 @@ driver = GraphDatabase.driver(
 
 class EntityQuery(BaseModel):
     name: str
+class VisionQuery(BaseModel):
 
+    candidate_names: List[str]
 
 class ImageMatchRequest(BaseModel):
     candidate_names: List[str] = Field(default_factory=list)
@@ -37,7 +39,67 @@ class ImageMatchRequest(BaseModel):
 
 
 
+@app.post("/vision-entity")
+def vision_entity(data: VisionQuery):
 
+
+    names=data.candidate_names
+
+
+    query="""
+
+    MATCH(n)
+
+    WHERE n.name IN $names
+
+    OPTIONAL MATCH
+    (n)-[r]-(m)
+
+
+    RETURN
+
+    n.id AS id,
+
+    n.name AS name,
+
+    labels(n) AS labels,
+
+    properties(n) AS entity,
+
+    collect(
+        {
+        relation:type(r),
+        target:properties(m)
+        }
+    ) AS relations
+
+
+    LIMIT 10
+
+    """
+
+
+
+    records,summary,keys = driver.execute_query(
+
+        query,
+
+        names=names
+
+    )
+
+
+
+    return {
+
+        "success":True,
+
+        "results":[
+            r.data()
+            for r in records
+        ]
+
+    }
 @app.get("/")
 def root():
 
