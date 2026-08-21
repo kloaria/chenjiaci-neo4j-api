@@ -28,9 +28,7 @@ driver = GraphDatabase.driver(
 
 class EntityQuery(BaseModel):
     name: str
-class VisionQuery(BaseModel):
 
-    candidate_names: List[str]
 
 class ImageMatchRequest(BaseModel):
     candidate_names: List[str] = Field(default_factory=list)
@@ -39,67 +37,7 @@ class ImageMatchRequest(BaseModel):
 
 
 
-@app.post("/vision-entity")
-def vision_entity(data: VisionQuery):
 
-
-    names=data.candidate_names
-
-
-    query="""
-
-    MATCH(n)
-
-    WHERE n.name IN $names
-
-    OPTIONAL MATCH
-    (n)-[r]-(m)
-
-
-    RETURN
-
-    n.id AS id,
-
-    n.name AS name,
-
-    labels(n) AS labels,
-
-    properties(n) AS entity,
-
-    collect(
-        {
-        relation:type(r),
-        target:properties(m)
-        }
-    ) AS relations
-
-
-    LIMIT 10
-
-    """
-
-
-
-    records,summary,keys = driver.execute_query(
-
-        query,
-
-        names=names
-
-    )
-
-
-
-    return {
-
-        "success":True,
-
-        "results":[
-            r.data()
-            for r in records
-        ]
-
-    }
 @app.get("/")
 def root():
 
@@ -230,85 +168,103 @@ def image_match(data: ImageMatchRequest):
             detail="candidate_names、visual_keywords 和 craft 不能同时为空"
         )
 
-    query = """
 
+
+
+    query = """
     WITH
         $candidate_names AS candidate_names,
         $visual_keywords AS visual_keywords,
-        trim(coalesce($craft,'')) AS craft
+        trim(coalesce($craft, '')) AS craft
 
-
-    MATCH(n:ImageRecognizable)
-
+    MATCH (n:ImageRecognizable)
 
     WITH
         n,
+        candidate_names,
         visual_keywords,
         craft,
 
+        CASE
+            WHEN n.name IN candidate_names
+            THEN 100
+            ELSE 0
+        END AS name_score,
+
+        [
+            x IN candidate_names
+            WHERE x IN coalesce(n.aliases, [])
+        ] AS matched_aliases,
 
         [
             x IN visual_keywords
-            WHERE x IN coalesce(n.visual_keywords,[])
+            WHERE x IN coalesce(n.visual_keywords, [])
         ] AS matched_keywords,
-
 
         CASE
             WHEN craft <> ''
-            AND (
-                craft = coalesce(n.craft,'')
-                OR craft IN coalesce(n.visual_keywords,[])
-            )
+                 AND (
+                     craft = coalesce(n.craft, '')
+                     OR craft IN coalesce(n.visual_keywords, [])
+                 )
             THEN 30
             ELSE 0
         END AS craft_score
 
 
+    WITH
+        n,
+        matched_aliases,
+        matched_keywords,
+
+        name_score,
+
+        size(matched_aliases) * 40
+            AS alias_score,
+
+        size(matched_keywords) * 10
+            AS visual_score,
+
+        craft_score
+
 
     WITH
         n,
+        matched_aliases,
         matched_keywords,
-        craft_score,
 
-
-        size(matched_keywords) * 20
-        AS visual_score
-
-
-
-    WITH
-        n,
-        matched_keywords,
+        name_score,
+        alias_score,
         visual_score,
         craft_score,
 
-
-        visual_score + craft_score
+        name_score
+        + alias_score
+        + visual_score
+        + craft_score
         AS score
 
 
+    WHERE score >= 40
 
-    WHERE score > 0
 
+    
 
     OPTIONAL MATCH
-    (n)-[:LOCATED_IN|DISPLAYED_IN|EXHIBIT_DISPLAYED_IN_SPACE]->(loc)
-
+        (n)-[:LOCATED_IN|DISPLAYED_IN|EXHIBIT_DISPLAYED_IN_SPACE]->(loc)
 
 
     RETURN
-
         n.id AS id,
-
         n.name AS name,
 
         labels(n) AS labels,
 
         n.craft AS craft,
 
-        collect(DISTINCT loc.name)
-        AS related_locations,
+        n.location AS location,
 
+        collect(DISTINCT loc.name) AS related_locations,
 
         n.visual_keywords AS visual_keywords,
 
@@ -316,20 +272,20 @@ def image_match(data: ImageMatchRequest):
 
         n.recognition_hint AS recognition_hint,
 
+        matched_aliases,
 
         matched_keywords,
 
+        name_score,
+        alias_score,
         visual_score,
-
         craft_score,
 
         score
 
-
     ORDER BY score DESC
 
     LIMIT 5
-
     """
 
 
