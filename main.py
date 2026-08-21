@@ -217,6 +217,7 @@ def image_match(data: ImageMatchRequest):
 
 
     MATCH(n:ImageRecognizable)
+    WHERE NOT "ScenicSpot" IN labels(n)
 
 
 
@@ -267,7 +268,7 @@ def image_match(data: ImageMatchRequest):
         craft,
 
 
-        size(matched_names)*50
+        size(matched_names)*20
         AS name_score,
 
 
@@ -283,6 +284,7 @@ def image_match(data: ImageMatchRequest):
         matched_keywords,
         name_score,
         visual_score,
+        type_score,
 
 
         CASE
@@ -306,6 +308,17 @@ def image_match(data: ImageMatchRequest):
             ELSE 0
 
         END AS craft_score
+        CASE
+
+           WHEN "ArchitecturalDecoration" IN labels(n)
+           THEN 20
+
+           WHEN "CollectionItem" IN labels(n)
+           THEN 10
+
+           ELSE 0
+
+        END AS type_score
 
 
 
@@ -324,6 +337,8 @@ def image_match(data: ImageMatchRequest):
         visual_score
         +
         craft_score
+        +
+        type_score
 
         AS score
 
@@ -379,6 +394,7 @@ def image_match(data: ImageMatchRequest):
 
 
         craft_score,
+        type_score,
 
 
         score
