@@ -208,12 +208,12 @@ def search_entity(data: EntityQuery):
 def image_match(data: ImageMatchRequest):
 
 
+
     candidate_names = [
         x.strip()
         for x in data.candidate_names
         if x and x.strip()
     ]
-
 
     visual_keywords = [
         x.strip()
@@ -221,116 +221,74 @@ def image_match(data: ImageMatchRequest):
         if x and x.strip()
     ]
 
-
     craft = data.craft.strip() if data.craft else ""
-
 
     if not candidate_names and not visual_keywords and not craft:
 
         raise HTTPException(
             status_code=400,
-            detail="输入信息不能为空"
+            detail="candidate_names、visual_keywords 和 craft 不能同时为空"
         )
-
 
     query = """
 
     WITH
-    $candidate_names AS candidate_names,
-    $visual_keywords AS visual_keywords,
-    trim(coalesce($craft,'')) AS craft
+        $candidate_names AS candidate_names,
+        $visual_keywords AS visual_keywords,
+        trim(coalesce($craft,'')) AS craft
 
 
     MATCH(n:ImageRecognizable)
 
 
     WITH
-    n,
-    candidate_names,
-    visual_keywords,
-    craft,
+        n,
+        visual_keywords,
+        craft,
 
 
-    // 名称匹配
-    [
-        x IN candidate_names
-        WHERE
-        x = n.name
-        OR x IN coalesce(n.aliases,[])
-    ]
-    AS matched_names,
+        [
+            x IN visual_keywords
+            WHERE x IN coalesce(n.visual_keywords,[])
+        ] AS matched_keywords,
 
 
-    // 视觉关键词匹配
-    [
-        x IN visual_keywords
-        WHERE
-        x IN coalesce(n.visual_keywords,[])
-    ]
-    AS matched_keywords
+        CASE
+            WHEN craft <> ''
+            AND (
+                craft = coalesce(n.craft,'')
+                OR craft IN coalesce(n.visual_keywords,[])
+            )
+            THEN 30
+            ELSE 0
+        END AS craft_score
 
 
 
     WITH
-    n,
-    matched_names,
-    matched_keywords,
-    craft,
+        n,
+        matched_keywords,
+        craft_score,
 
 
-    CASE
-        WHEN size(matched_names)>0
-        THEN 50
-        ELSE 0
-    END AS name_score,
-
-
-    CASE
-        WHEN craft <> ''
-        AND (
-            craft = coalesce(n.craft,'')
-            OR craft IN coalesce(n.visual_keywords,[])
-        )
-        THEN 20
-        ELSE 0
-    END AS craft_score
+        size(matched_keywords) * 20
+        AS visual_score
 
 
 
     WITH
-    n,
-    matched_names,
-    matched_keywords,
-    name_score,
-    craft_score,
+        n,
+        matched_keywords,
+        visual_score,
+        craft_score,
 
 
-    CASE
-        WHEN size(matched_keywords)>5
-        THEN 50
-        ELSE size(matched_keywords)*10
-    END AS visual_score
+        visual_score + craft_score
+        AS score
 
 
 
-    WITH
-    n,
-    matched_names,
-    matched_keywords,
-    name_score,
-    visual_score,
-    craft_score,
-
-
-    name_score+
-    visual_score+
-    craft_score
-    AS score
-
-
-
-    WHERE score >= 20
-
+    WHERE score > 0
 
 
     OPTIONAL MATCH
@@ -340,47 +298,40 @@ def image_match(data: ImageMatchRequest):
 
     RETURN
 
+        n.id AS id,
 
-    n.id AS id,
+        n.name AS name,
 
-    n.name AS name,
+        labels(n) AS labels,
 
-    labels(n) AS labels,
+        n.craft AS craft,
 
-    n.craft AS craft,
-
-
-    collect(DISTINCT loc.name)
-    AS related_locations,
+        collect(DISTINCT loc.name)
+        AS related_locations,
 
 
-    n.visual_keywords AS visual_keywords,
+        n.visual_keywords AS visual_keywords,
 
-    n.visual_description AS visual_description,
+        n.visual_description AS visual_description,
 
-    n.recognition_hint AS recognition_hint,
+        n.recognition_hint AS recognition_hint,
 
 
-    matched_names,
+        matched_keywords,
 
-    matched_keywords,
+        visual_score,
 
-    name_score,
+        craft_score,
 
-    visual_score,
-
-    craft_score,
-
-    score
-
+        score
 
 
     ORDER BY score DESC
 
-
     LIMIT 5
 
     """
+
 
 
 
@@ -393,7 +344,6 @@ def image_match(data: ImageMatchRequest):
             craft=craft
         )
 
-
     except Exception as e:
 
         raise HTTPException(
@@ -402,55 +352,53 @@ def image_match(data: ImageMatchRequest):
         )
 
 
-
-    results=[
-        r.data()
-        for r in records
+    results = [
+        record.data()
+        for record in records
     ]
+
 
 
 
     if not results:
 
         return {
+            "success": True,
+            "matched": False,
 
-            "success":True,
-
-            "matched":False,
-
-            "input":{
-                "candidate_names":candidate_names,
-                "visual_keywords":visual_keywords,
-                "craft":craft
+            "input": {
+                "candidate_names": candidate_names,
+                "visual_keywords": visual_keywords,
+                "craft": craft
             },
 
-            "results":[]
+            "message": "当前知识图谱中没有找到置信度足够高的图片匹配实体。",
 
+            "results": []
         }
 
 
 
+
+    best_match = results[0]
+
     return {
+        "success": True,
+        "matched": True,
 
-        "success":True,
-
-        "matched":True,
-
-
-        "input":{
-            "candidate_names":candidate_names,
-            "visual_keywords":visual_keywords,
-            "craft":craft
+        "input": {
+            "candidate_names": candidate_names,
+            "visual_keywords": visual_keywords,
+            "craft": craft
         },
 
+        "best_match": best_match,
 
-        "best_match":results[0],
+        "count": len(results),
 
-        "count":len(results),
-
-        "results":results
-
+        "results": results
     }
+
 
 
 
