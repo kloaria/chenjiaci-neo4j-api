@@ -41,7 +41,7 @@ async def lifespan(_: FastAPI):
 app = FastAPI(
     title="Chenjiaci Neo4j API",
     description="陈家祠知识图谱查询、图片实体匹配与馆内导航服务",
-    version="2.1.0",
+    version="2.2.0",
     lifespan=lifespan,
 )
 
@@ -143,7 +143,6 @@ def score_entity(
 
     name_sim, matched_name, matched_name_target = _best_match(candidate_names, [name])
     alias_sim, matched_alias, matched_alias_target = _best_match(candidate_names, aliases)
-
     # 名称只作为辅助证据，避免 Vision 猜错名称时压过真实视觉特征。
     if name_sim == 1.0:
         name_score, name_match_type = 25.0, "exact_name"
@@ -159,13 +158,10 @@ def score_entity(
         # 第一优先：结构化 visual_keywords。
         sim, _, target = _best_match([keyword], entity_keywords)
 
-        # 第二优先：visual_description / recognition_hint。
-        # 对“瑞兽”“屋脊”“人物”这类短词，显式包含应视为强证据，
-        # 不再让短词与整句描述的长度差把相似度压低。
+        # 第二优先：描述和识别提示。短词被描述直接包含时视为强证据。
         keyword_norm = normalize(keyword)
         description_norm = normalize(description)
         hint_norm = normalize(recognition_hint)
-
         if len(keyword_norm) >= 2 and (
             keyword_norm in description_norm or keyword_norm in hint_norm
         ):
@@ -177,8 +173,7 @@ def score_entity(
             )
         else:
             desc_sim, _, desc_target = _best_match(
-                [keyword],
-                [description, recognition_hint],
+                [keyword], [description, recognition_hint]
             )
             if desc_target == description:
                 desc_source = "visual_description"
@@ -189,49 +184,25 @@ def score_entity(
 
         # 字段化视觉关键词证据强于自然语言描述证据。
         if sim >= 0.58:
-            matched_keywords.append(
-                {
-                    "input": keyword,
-                    "target": target,
-                    "similarity": sim,
-                    "source": "visual_keywords",
-                }
-            )
+            matched_keywords.append({"input": keyword, "target": target, "similarity": sim, "source": "visual_keywords"})
         elif len(keyword_norm) >= 2 and desc_sim >= 0.72:
-            matched_keywords.append(
-                {
-                    "input": keyword,
-                    "target": desc_source,
-                    "similarity": desc_sim,
-                    "source": desc_source,
-                }
-            )
+            matched_keywords.append({"input": keyword, "target": desc_source, "similarity": desc_sim, "source": desc_source})
 
     keyword_strength = sum(float(x["similarity"]) for x in matched_keywords)
     visual_score = min(48.0, round(keyword_strength * 12.0, 2))
     combo_score = 15.0 if len(matched_keywords) >= 2 else 0.0
 
-    # craft 既匹配专门的 craft 字段，也匹配 visual_keywords，
-    # 兼容部分节点 craft 为空、但 visual_keywords 中包含“灰塑/木雕/陶塑”等工艺词。
+    # craft 同时匹配专门字段和视觉关键词，兼容 craft 属性为空的节点。
     craft_targets = [entity_craft] + entity_keywords
     craft_sim, _, matched_craft_target = (
         _best_match([craft], craft_targets) if craft else (0.0, None, None)
     )
-    craft_score = (
-        18.0
-        if craft_sim == 1.0
-        else round(14.0 * craft_sim, 2)
-        if craft_sim >= 0.6
-        else 0.0
-    )
+    craft_score = 18.0 if craft_sim == 1.0 else (round(14.0 * craft_sim, 2) if craft_sim >= 0.6 else 0.0)
 
     raw_score = round(name_score + visual_score + combo_score + craft_score, 2)
     has_exact_name = name_match_type in {"exact_name", "exact_alias"}
     penalty = 0.55 if "LowVisualFeature" in labels and not has_exact_name else 1.0
     score = round(raw_score * penalty, 2)
-
-    # 名称不再允许单独构成“强证据”。
-    # 至少需要视觉/工艺交叉验证，避免 Vision 只猜中一个错误名称就直接命中。
     strong_evidence = (
         len(matched_keywords) >= 2
         or (len(matched_keywords) >= 1 and craft_score > 0)
@@ -280,7 +251,7 @@ def _resolve_synonyms(keywords: list[str]) -> tuple[list[str], dict[str, str]]:
 
 @app.get("/")
 def root():
-    return {"status": "ok", "service": "Chenjiaci Neo4j API", "version": "2.1.0",
+    return {"status": "ok", "service": "Chenjiaci Neo4j API", "version": "2.2.0",
             "available_tools": ["/health", "/entity", "/vision-entity", "/image-match", "/indoor-route"]}
 
 
@@ -366,7 +337,8 @@ def image_match(data: ImageMatchRequest):
 
     ranked = [score_entity(r.data(), candidate_names, normalized_keywords, craft) for r in records]
     ranked = [x for x in ranked if x["score"] > 0]
-    # 总分相同时优先视觉证据，再看工艺，最后才看名称。
+    # 不设置绝对分数或动态阈值：只要获得正分，就按总分决定胜者。
+    # 同分时优先视觉证据、组合特征、工艺，最后才看名称。
     ranked.sort(
         key=lambda x: (
             x["score"],
@@ -377,19 +349,16 @@ def image_match(data: ImageMatchRequest):
         ),
         reverse=True,
     )
-
-    best_score = ranked[0]["score"] if ranked else 0.0
-    threshold = max(25.0, best_score * 0.65)
-    results = [x for x in ranked if x["score"] >= threshold and x["strong_evidence"]][: data.top_k]
+    results = ranked[: data.top_k]
     for item in results:
         item.pop("strong_evidence", None)
 
     if not results:
         return {"success": True, "matched": False, "input": input_data,
                 "normalized_keywords": normalized_keywords, "synonym_mapping": synonym_mapping,
-                "message": "没有找到证据充分的匹配实体，请补充更具体的视觉关键词。", "results": []}
+                "message": "所有候选实体得分均为 0，请补充至少一个可匹配特征。", "results": []}
 
-    gap = round(results[0]["score"] - (results[1]["score"] if len(results) > 1 else threshold), 2)
+    gap = round(results[0]["score"] - (results[1]["score"] if len(results) > 1 else 0.0), 2)
     return {"success": True, "matched": True, "input": input_data,
             "normalized_keywords": normalized_keywords, "synonym_mapping": synonym_mapping,
             "best_match": results[0], "score_gap": gap, "count": len(results), "results": results}
