@@ -41,7 +41,7 @@ async def lifespan(_: FastAPI):
 app = FastAPI(
     title="Chenjiaci Neo4j API",
     description="陈家祠知识图谱查询、图片实体匹配与馆内导航服务",
-    version="2.2.0",
+    version="2.3.0",
     lifespan=lifespan,
 )
 
@@ -251,7 +251,7 @@ def _resolve_synonyms(keywords: list[str]) -> tuple[list[str], dict[str, str]]:
 
 @app.get("/")
 def root():
-    return {"status": "ok", "service": "Chenjiaci Neo4j API", "version": "2.2.0",
+    return {"status": "ok", "service": "Chenjiaci Neo4j API", "version": "2.3.0",
             "available_tools": ["/health", "/entity", "/vision-entity", "/image-match", "/indoor-route"]}
 
 
@@ -323,6 +323,12 @@ def image_match(data: ImageMatchRequest):
         normalized_keywords, synonym_mapping = _resolve_synonyms(visual_keywords)
         query = """
         MATCH (n:ImageRecognizable)
+        WHERE NOT 'ScenicSpot' IN labels(n)
+          AND (
+              (n.visual_keywords IS NOT NULL AND size(n.visual_keywords) > 0)
+              OR trim(coalesce(n.visual_description, '')) <> ''
+              OR trim(coalesce(n.recognition_hint, '')) <> ''
+          )
         OPTIONAL MATCH (n)-[:LOCATED_IN|DISPLAYED_IN|EXHIBIT_DISPLAYED_IN_SPACE]->(loc)
         RETURN n.id AS id, n.name AS name, labels(n) AS labels,
                n.aliases AS aliases, n.craft AS craft,
