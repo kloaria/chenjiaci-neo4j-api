@@ -40,8 +40,8 @@ async def lifespan(_: FastAPI):
 
 app = FastAPI(
     title="Chenjiaci Neo4j API",
-    description="陈家祠知识图谱查询、图片实体匹配与馆内导航服务（v2.3 + always_recall 整合版，无 type_score）",
-    version="2.6.0",
+    description="陈家祠知识图谱查询、图片实体匹配与馆内导航服务（improved：通用词降权+craft推断+保底召回）",
+    version="2.3.1",
     lifespan=lifespan,
 )
 
@@ -67,9 +67,8 @@ def _db():
     return driver
 
 
-# ===================== 文本工具函数（保留版本b/d） =====================
 def normalize(value: Any) -> str:
-    """统一大小写、全半角及标点；保留中文字符、英文字母、数字。"""
+    """统一大小写、全半角及标点；保留中英文、数字。"""
     text = unicodedata.normalize("NFKC", str(value or "")).lower().strip()
     return re.sub(r"[^0-9a-z\u4e00-\u9fff]+", "", text)
 
@@ -130,20 +129,10 @@ def _best_match(inputs: list[str], targets: list[str]) -> tuple[float, str | Non
     return best
 
 
-# ===================== 打分函数（always_recall 版） =====================
 def score_entity(
     entity: dict[str, Any], candidate_names: list[str], visual_keywords: list[str], craft: str
 ) -> dict[str, Any]:
-    """纯函数评分，便于离线做标注集回归测试。
-
-    本版为 v2.3 与 always_recall 版的整合：
-      - 保留名称弱匹配兜底（0.40~0.62）
-      - combo_score 在匹配 >=2 个视觉关键词时为 30
-      - LowVisualFeature 惩罚调整为 0.4
-      - 新增 confidence 置信度等级（high/medium/low）
-      - 移除所有硬性分数下限过滤，保底返回候选
-      - 不引入 type_score，实体类型不参与加分
-    """
+    """纯函数评分，便于离线做标注集回归测试。"""
     name = str(entity.get("name") or "")
     aliases = as_list(entity.get("aliases"))
     labels = list(entity.get("labels") or [])
@@ -152,32 +141,28 @@ def score_entity(
     recognition_hint = str(entity.get("recognition_hint") or "")
     entity_craft = str(entity.get("craft") or "")
 
-    # ---- 名称匹配（保留版本d的 text_similarity 精度 + 弱匹配兜底）----
     name_sim, matched_name, matched_name_target = _best_match(candidate_names, [name])
     alias_sim, matched_alias, matched_alias_target = _best_match(candidate_names, aliases)
-    best_name_sim = max(name_sim, alias_sim)
-
     # 名称只作为辅助证据，避免 Vision 猜错名称时压过真实视觉特征。
     if name_sim == 1.0:
         name_score, name_match_type = 25.0, "exact_name"
     elif alias_sim == 1.0:
         name_score, name_match_type = 22.0, "exact_alias"
-    elif best_name_sim >= 0.62:
-        name_score = round(15.0 * best_name_sim, 2)
-        name_match_type = "fuzzy"
-    elif best_name_sim >= 0.40:
-        name_score = round(8.0 * best_name_sim, 2)
-        name_match_type = "weak_fuzzy"
     else:
-        name_score, name_match_type = 0.0, "none"
+        best_name_sim = max(name_sim, alias_sim)
+        name_score = round(15.0 * best_name_sim, 2) if best_name_sim >= 0.62 else 0.0
+        name_match_type = "fuzzy" if name_score else "none"
 
-    # ---- 视觉关键词匹配（保留版本d逻辑）----
+    # ===== 修改点1：字段命中 12 分、描述命中 6 分（降权），同一关键词两边都中只取最高分 =====
     matched_keywords: list[dict[str, Any]] = []
+    visual_total = 0.0
     for keyword in visual_keywords:
-        # 第一优先：结构化 visual_keywords。
+        # 第一优先：结构化 visual_keywords 字段命中（系数 12）。
         sim, _, target = _best_match([keyword], entity_keywords)
+        field_hit = sim >= 0.58
+        field_score = round(sim * 12.0, 2) if field_hit else 0.0
 
-        # 第二优先：描述和识别提示。短词被描述直接包含时视为强证据。
+        # 第二优先：描述和识别提示命中（系数 6，降权以抑制通用词干扰）。
         keyword_norm = normalize(keyword)
         description_norm = normalize(description)
         hint_norm = normalize(recognition_hint)
@@ -200,45 +185,38 @@ def score_entity(
                 desc_source = "recognition_hint"
             else:
                 desc_source = "description"
+        desc_hit = len(keyword_norm) >= 2 and desc_sim >= 0.72
+        desc_score = round(desc_sim * 6.0, 2) if desc_hit else 0.0
 
-        # 字段化视觉关键词证据强于自然语言描述证据。
-        if sim >= 0.58:
-            matched_keywords.append({"input": keyword, "target": target, "similarity": sim, "source": "visual_keywords"})
-        elif len(keyword_norm) >= 2 and desc_sim >= 0.72:
-            matched_keywords.append({"input": keyword, "target": desc_source, "similarity": desc_sim, "source": desc_source})
+        # 合并：同一关键词在字段与描述都命中时，只取最高分，不重复累加。
+        if field_hit and desc_hit:
+            if field_score >= desc_score:
+                matched_keywords.append({"input": keyword, "target": target, "similarity": sim, "source": "visual_keywords", "score": field_score})
+                visual_total += field_score
+            else:
+                matched_keywords.append({"input": keyword, "target": desc_source, "similarity": desc_sim, "source": desc_source, "score": desc_score})
+                visual_total += desc_score
+        elif field_hit:
+            matched_keywords.append({"input": keyword, "target": target, "similarity": sim, "source": "visual_keywords", "score": field_score})
+            visual_total += field_score
+        elif desc_hit:
+            matched_keywords.append({"input": keyword, "target": desc_source, "similarity": desc_sim, "source": desc_source, "score": desc_score})
+            visual_total += desc_score
 
-    keyword_strength = sum(float(x["similarity"]) for x in matched_keywords)
-    visual_score = min(48.0, round(keyword_strength * 12.0, 2))
-    combo_score = 30.0 if len(matched_keywords) >= 2 else 0.0
+    visual_score = min(48.0, round(visual_total, 2))
+    combo_score = 15.0 if len(matched_keywords) >= 2 else 0.0
 
-    # ---- 工艺匹配（保留版本d逻辑）----
+    # craft 同时匹配专门字段和视觉关键词，兼容 craft 属性为空的节点。
     craft_targets = [entity_craft] + entity_keywords
     craft_sim, _, matched_craft_target = (
         _best_match([craft], craft_targets) if craft else (0.0, None, None)
     )
     craft_score = 18.0 if craft_sim == 1.0 else (round(14.0 * craft_sim, 2) if craft_sim >= 0.6 else 0.0)
 
-
-    # 不使用 type_score：实体标签类型不直接影响匹配总分。
     raw_score = round(name_score + visual_score + combo_score + craft_score, 2)
-
-    # ---- LowVisualFeature 惩罚（调整为 0.4，保留 exact_name 豁免）----
-    # always_recall：更强的降权（0.55→0.4）让低视觉特征实体排名更靠后，
-    # 但由于移除了所有硬性阈值过滤，它依然会参与排序并被返回，不会被排除。
     has_exact_name = name_match_type in {"exact_name", "exact_alias"}
-    penalty = 0.4 if "LowVisualFeature" in labels and not has_exact_name else 1.0
+    penalty = 0.55 if "LowVisualFeature" in labels and not has_exact_name else 1.0
     score = round(raw_score * penalty, 2)
-
-    # ---- 置信度等级（新增：替代硬性阈值过滤）----
-    # 前端/智能体据此判断结果质量，而非依赖接口返回空列表。
-    if score >= 60:
-        confidence = "high"
-    elif score >= 30:
-        confidence = "medium"
-    else:
-        confidence = "low"
-
-    # ---- strong_evidence（保留版本d逻辑）----
     strong_evidence = (
         len(matched_keywords) >= 2
         or (len(matched_keywords) >= 1 and craft_score > 0)
@@ -264,17 +242,12 @@ def score_entity(
         },
         "raw_score": raw_score,
         "score": score,
-        "confidence": confidence,
         "strong_evidence": strong_evidence,
     }
 
 
-# ===================== 同义词归一化（保留版本d双向匹配）=====================
 def _resolve_synonyms(keywords: list[str]) -> tuple[list[str], dict[str, str]]:
-    """支持优化版同义词本体；没有本体或未命中时安全回退。
-
-    本体结构：(:FeatureTerm)-[:HAS_SYNONYM]->(:VisualSynonym)
-    """
+    """支持优化版同义词本体；没有本体或未命中时安全回退。"""
     if not keywords:
         return [], {}
     query = """
@@ -290,10 +263,9 @@ def _resolve_synonyms(keywords: list[str]) -> tuple[list[str], dict[str, str]]:
     return normalized, mapping
 
 
-# ===================== 接口路由 =====================
 @app.get("/")
 def root():
-    return {"status": "ok", "service": "Chenjiaci Neo4j API", "version": "2.6.0",
+    return {"status": "ok", "service": "Chenjiaci Neo4j API", "version": "2.3.1",
             "available_tools": ["/health", "/entity", "/vision-entity", "/image-match", "/indoor-route"]}
 
 
@@ -351,21 +323,30 @@ def search_entity(data: EntityQuery):
         raise HTTPException(status_code=500, detail=f"知识图谱查询失败：{exc}") from exc
 
 
-# ===================== /image-match（always_recall：保底召回）=====================
 @app.post("/image-match")
 def image_match(data: ImageMatchRequest):
     candidate_names = clean_list(data.candidate_names)
     visual_keywords = clean_list(data.visual_keywords)
     craft = data.craft.strip()
-    input_data = {"candidate_names": candidate_names, "visual_keywords": visual_keywords, "craft": craft}
 
-    # ===== 边界情况1：输入为空，直接返回提示，不查数据库 =====
+    # ===== 修改点2：craft 为空时从 candidate_names 自动推断工艺 =====
+    # 遍历候选名，命中第一个工艺关键词即回填，用于后续 craft 维度评分。
+    if not craft:
+        craft_keywords = ["木雕", "石雕", "砖雕", "灰塑", "陶塑", "彩绘", "铁铸", "铜铸", "玉雕"]
+        for cname in candidate_names:
+            for ck in craft_keywords:
+                if ck in cname:
+                    craft = ck
+                    break
+            if craft:
+                break
+
+    input_data = {"candidate_names": candidate_names, "visual_keywords": visual_keywords, "craft": craft}
     if not candidate_names and not visual_keywords and not craft:
         return {"success": False, "matched": False, "input": input_data,
                 "message": "图片未提取到有效视觉特征。", "results": []}
 
     try:
-        # 保留：同义词归一化（双向匹配）
         normalized_keywords, synonym_mapping = _resolve_synonyms(visual_keywords)
         query = """
         MATCH (n:ImageRecognizable)
@@ -387,16 +368,9 @@ def image_match(data: ImageMatchRequest):
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"图片实体匹配失败：{exc}") from exc
 
-    # Python 层打分（score_entity 纯函数）
     ranked = [score_entity(r.data(), candidate_names, normalized_keywords, craft) for r in records]
-
-    # ===== 核心修改：移除所有硬性分数下限过滤 =====
-    # 版本d原逻辑：ranked = [x for x in ranked if x["score"] > 0]  → 过滤0分
-    # 版本d原逻辑：if ranked: dynamic_threshold = max(20.0, 0.6*max); ranked = [x ... >= threshold]
-    # always_recall：两者均删除，所有候选（含0分）都参与排序，保证非空即召回。
-    # 宁可返回低分候选（confidence=low），也不返回空列表。
-
-    # 保留多键排序：同分时优先视觉证据、组合特征、工艺，最后才看名称
+    # ===== 修改点3：始终召回，移除 score>0 硬性下限过滤 =====
+    # 不设绝对分数或动态阈值，所有候选都参与排序，保证非空即返回 Top-N。
     ranked.sort(
         key=lambda x: (
             x["score"],
@@ -411,21 +385,15 @@ def image_match(data: ImageMatchRequest):
     for item in results:
         item.pop("strong_evidence", None)
 
-    # ===== 边界情况2：数据库无任何候选实体 → 返回空列表 matched:false =====
-    # ===== 除此之外，ranked 非空时必然返回至少 1 个实体（即使最高分只有 5 分）=====
     if not results:
         return {"success": True, "matched": False, "input": input_data,
                 "normalized_keywords": normalized_keywords, "synonym_mapping": synonym_mapping,
-                "overall_confidence": "low",
                 "message": "知识图谱中暂无任何可匹配候选实体。", "results": []}
 
-    # ===== 新增：overall_confidence 取 best_match 的置信度等级 =====
-    overall_confidence = results[0]["confidence"]
     gap = round(results[0]["score"] - (results[1]["score"] if len(results) > 1 else 0.0), 2)
     return {"success": True, "matched": True, "input": input_data,
             "normalized_keywords": normalized_keywords, "synonym_mapping": synonym_mapping,
-            "best_match": results[0], "overall_confidence": overall_confidence,
-            "score_gap": gap, "count": len(results), "results": results}
+            "best_match": results[0], "score_gap": gap, "count": len(results), "results": results}
 
 
 @app.get("/indoor-route")
